@@ -24,6 +24,8 @@ var chinaLoc *time.Location
 
 var httpTimeout = 15 * time.Second
 
+var customHeaders = map[string]string{}
+
 func initChinaLoc() {
 	if loc, err := time.LoadLocation("Asia/Shanghai"); err == nil && loc != nil {
 		chinaLoc = loc
@@ -39,6 +41,14 @@ func nowCST() time.Time {
 	return time.Now().In(chinaLoc)
 }
 
+func truncate(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "..."
+}
+
 type apiResult struct {
 	name     string
 	url      string
@@ -46,6 +56,7 @@ type apiResult struct {
 	elapsed  time.Duration
 	err      error
 	bodySize int
+	body     string
 	success  bool
 }
 
@@ -71,7 +82,15 @@ func doRequest(name, url, method, body string) apiResult {
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("User-Agent", "Nettap/1.0")
+	req.Header.Set("Origin", "https://www.insigmind.com")
+	req.Header.Set("Referer", "https://www.insigmind.com/")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	for k, v := range customHeaders {
+		req.Header.Set(k, v)
+	}
 
 	start := nowCST()
 	resp, err := client.Do(req)
@@ -87,6 +106,7 @@ func doRequest(name, url, method, body string) apiResult {
 		status:   resp.StatusCode,
 		elapsed:  time.Since(start),
 		bodySize: len(data),
+		body:     truncate(string(data), 200),
 		success:  resp.StatusCode == 200,
 	}
 }
@@ -135,7 +155,7 @@ func runRound(concurrency int) {
 			log.Printf("  ✗ %s | 错误: %v | 耗时: %v", r.name, r.err, r.elapsed.Round(time.Millisecond))
 		} else if !r.success {
 			fail++
-			log.Printf("  ⚠ %s | HTTP %d | 耗时: %v | 响应: %d 字节", r.name, r.status, r.elapsed.Round(time.Millisecond), r.bodySize)
+			log.Printf("  ⚠ %s | HTTP %d | 耗时: %v | 响应: %s", r.name, r.status, r.elapsed.Round(time.Millisecond), r.body)
 		} else {
 			success++
 			log.Printf("  ✓ %s | HTTP %d | 耗时: %v | 响应: %d 字节", r.name, r.status, r.elapsed.Round(time.Millisecond), r.bodySize)
@@ -167,6 +187,7 @@ func runFullPower(concurrency int) {
 		totalDur time.Duration
 		minDur   time.Duration
 		maxDur   time.Duration
+		failBuf  []apiResult
 	}
 
 	s := &stats{}
@@ -187,6 +208,10 @@ func runFullPower(concurrency int) {
 					}
 					if r.err != nil || !r.success {
 						s.fail++
+						if len(s.failBuf) >= 5 {
+							s.failBuf = s.failBuf[1:]
+						}
+						s.failBuf = append(s.failBuf, r)
 					} else {
 						s.success++
 					}
@@ -213,6 +238,8 @@ func runFullPower(concurrency int) {
 		}
 		minDur := s.minDur
 		maxDur := s.maxDur
+		failBuf := make([]apiResult, len(s.failBuf))
+		copy(failBuf, s.failBuf)
 		s.mu.Unlock()
 
 		now := nowCST()
@@ -226,6 +253,107 @@ func runFullPower(concurrency int) {
 		log.Printf("⚡ [运行 %v] 总请求=%d 成功=%d 失败=%d | RPS=%.1f/s | 平均=%v 最小=%v 最大=%v",
 			uptime.Round(time.Second), total, success, fail,
 			rps, avgDur.Round(time.Millisecond), minDur.Round(time.Millisecond), maxDur.Round(time.Millisecond))
+		for _, fr := range failBuf {
+			if fr.err != nil {
+				log.Printf("  ✗ %s | 错误: %v | 耗时: %v", fr.name, fr.err, fr.elapsed.Round(time.Millisecond))
+			} else {
+				log.Printf("  ⚠ %s | HTTP %d | 耗时: %v | 响应: %s", fr.name, fr.status, fr.elapsed.Round(time.Millisecond), fr.body)
+			}
+		}
+	}
+}
+
+func runRate(ratePerMinute, concurrency int) {
+	intervalPerReq := time.Minute / time.Duration(ratePerMinute)
+	log.Printf("📊 速率模式 | 每接口 %d 次/分钟 (每 %.0fms 发一次), 并发 %d",
+		ratePerMinute, float64(intervalPerReq)/float64(time.Millisecond), concurrency)
+
+	type task struct {
+		name   string
+		url    string
+		method string
+		body   string
+	}
+
+	tasks := []task{
+		{"首页统计", statsAPIURL, "GET", ""},
+		{"需求列表", demandAPIURL, "POST", demandPayload},
+	}
+
+	type stats struct {
+		mu      sync.Mutex
+		total   int
+		success int
+		fail    int
+		failBuf []apiResult
+	}
+
+	s := &stats{}
+
+	for _, t := range tasks {
+		go func(tk task) {
+			limiter := time.NewTicker(intervalPerReq)
+			defer limiter.Stop()
+			for range limiter.C {
+				var wg sync.WaitGroup
+				wg.Add(concurrency)
+				for i := 0; i < concurrency; i++ {
+					go func(idx int) {
+						defer wg.Done()
+						r := doRequest(tk.name, tk.url, tk.method, tk.body)
+						s.mu.Lock()
+						s.total++
+						if r.err != nil || !r.success {
+							s.fail++
+							if len(s.failBuf) >= 5 {
+								s.failBuf = s.failBuf[1:]
+							}
+							r.name = fmt.Sprintf("%s#%d", tk.name, idx+1)
+							s.failBuf = append(s.failBuf, r)
+						} else {
+							s.success++
+						}
+						s.mu.Unlock()
+					}(i)
+				}
+				wg.Wait()
+			}
+		}(t)
+	}
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	startTime := nowCST()
+	lastTotal := 0
+	lastTime := startTime
+
+	for range ticker.C {
+		s.mu.Lock()
+		total := s.total
+		success := s.success
+		fail := s.fail
+		failBuf := make([]apiResult, len(s.failBuf))
+		copy(failBuf, s.failBuf)
+		s.mu.Unlock()
+
+		now := nowCST()
+		elapsed := now.Sub(lastTime)
+		intervalCount := total - lastTotal
+		rps := float64(intervalCount) / elapsed.Seconds()
+		lastTotal = total
+		lastTime = now
+
+		uptime := now.Sub(startTime)
+		log.Printf("📊 [运行 %v] 总请求=%d 成功=%d 失败=%d | 实际RPS=%.2f/s (目标=%.2f/s)",
+			uptime.Round(time.Second), total, success, fail,
+			rps, float64(ratePerMinute*len(tasks))/60.0)
+		for _, fr := range failBuf {
+			if fr.err != nil {
+				log.Printf("  ✗ %s | 错误: %v | 耗时: %v", fr.name, fr.err, fr.elapsed.Round(time.Millisecond))
+			} else {
+				log.Printf("  ⚠ %s | HTTP %d | 耗时: %v | 响应: %s", fr.name, fr.status, fr.elapsed.Round(time.Millisecond), fr.body)
+			}
+		}
 	}
 }
 
@@ -251,7 +379,7 @@ func main() {
 	cpus := runtime.NumCPU()
 	if cfg.Concurrency < 1 {
 		if cfg.FullPower {
-			cfg.Concurrency = cpus * 10
+			cfg.Concurrency = cpus * 2
 		} else {
 			cfg.Concurrency = 1
 		}
@@ -260,8 +388,16 @@ func main() {
 	log.Printf("配置文件: %s | CPU 核心: %d", defaultConfigPath, cpus)
 
 	if cfg.FullPower {
-		log.Printf("⚡ 全力模式 | 每接口并发 %d (自动=%d)", cfg.Concurrency, cpus*10)
+		log.Printf("⚡ 全力模式 | 每接口并发 %d (自动=%d)", cfg.Concurrency, cpus*2)
 		runFullPower(cfg.Concurrency)
+		return
+	}
+
+	if cfg.RatePerMinute > 0 {
+		if cfg.RatePerMinute > 60000 {
+			log.Fatalf("rate_per_minute 不能超过 60000（每秒 1000 次）")
+		}
+		runRate(cfg.RatePerMinute, cfg.Concurrency)
 		return
 	}
 
