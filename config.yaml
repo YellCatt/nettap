@@ -22,7 +22,7 @@ once: false
 # 例: rate_per_minute: 30  => 每个接口每秒 0.5 次，2 秒发 1 次
 # 例: rate_per_minute: 120 => 每个接口每秒 2 次
 # 例: rate_per_hour: 3600  => 每个接口每秒 1 次（等同于 rate_per_minute: 60）
-rate_per_minute: 30
+rate_per_minute: 1
 rate_per_hour: 0
 
 # ------------------------- 并发设置 -------------------------
