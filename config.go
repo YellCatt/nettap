@@ -11,24 +11,22 @@ type Config struct {
 	Interval    string `yaml:"interval"`
 	Concurrency int    `yaml:"concurrency"`
 	Once        bool   `yaml:"once"`
+	FullPower   bool   `yaml:"full_power"`
 	Timeout     int    `yaml:"timeout_seconds"`
 }
 
 const defaultConfigPath = "config.yaml"
 
-const configTemplate = `# nettap 配置文件（首次运行自动生成，可按需修改，重启后生效）
+const configTemplate = `# ==========================================================================
+# Nettap 并发请求工具配置文件
+# 修改后重启程序生效，也可通过 -config=path/to/config.yaml 指定路径
+# ==========================================================================
 
-# 执行间隔，支持的格式: 30s, 5m, 1h, 2h30m
-interval: "1h"
-
-# 每个接口的并发请求数
-concurrency: 1
-
-# 是否只执行一轮后退出（true=只跑一轮就退出，false=持续运行）
-once: false
-
-# 单个请求的超时时间（秒）
-timeout_seconds: 15
+interval: "1h"            # 执行间隔，格式: 30s / 5m / 1h / 2h30m
+once: false               # true=只跑一轮退出，false=持续运行
+concurrency: 1            # 每个接口的并发请求数
+full_power: false         # true=全力模式，不停发请求，忽略 interval
+timeout_seconds: 15       # 单个请求超时秒数
 `
 
 func defaultConfig() Config {

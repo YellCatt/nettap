@@ -2,11 +2,11 @@ package main
 
 import (
 	"crypto/tls"
-	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -144,48 +144,100 @@ func runRound(concurrency int) {
 	log.Printf("========== 本轮完成: 共 %d 请求, 成功 %d, 失败 %d ==========", total, success, fail)
 }
 
-func main() {
-	once := flag.Bool("once", false, "只执行一轮后退出")
-	interval := flag.String("interval", "", "执行间隔，如 30s / 5m / 1h（覆盖 config.yaml）")
-	concurrency := flag.Int("c", 0, "每个接口的并发请求数（覆盖 config.yaml）")
-	configPath := flag.String("config", defaultConfigPath, "配置文件路径")
-	showVersion := flag.Bool("version", false, "打印版本号后退出")
-	flag.Parse()
+func runFullPower(concurrency int) {
+	log.Printf("⚡ 全力模式启动！每接口并发 %d，不停发请求", concurrency)
 
+	type task struct {
+		name   string
+		url    string
+		method string
+		body   string
+	}
+
+	tasks := []task{
+		{"首页统计", statsAPIURL, "GET", ""},
+		{"需求列表", demandAPIURL, "POST", demandPayload},
+	}
+
+	type stats struct {
+		mu       sync.Mutex
+		total    int
+		success  int
+		fail     int
+		totalDur time.Duration
+		minDur   time.Duration
+		maxDur   time.Duration
+	}
+
+	s := &stats{}
+
+	for _, t := range tasks {
+		for i := 0; i < concurrency; i++ {
+			go func(tk task) {
+				for {
+					r := doRequest(tk.name, tk.url, tk.method, tk.body)
+					s.mu.Lock()
+					s.total++
+					s.totalDur += r.elapsed
+					if s.minDur == 0 || r.elapsed < s.minDur {
+						s.minDur = r.elapsed
+					}
+					if r.elapsed > s.maxDur {
+						s.maxDur = r.elapsed
+					}
+					if r.err != nil || !r.success {
+						s.fail++
+					} else {
+						s.success++
+					}
+					s.mu.Unlock()
+				}
+			}(t)
+		}
+	}
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	startTime := nowCST()
+	lastTotal := 0
+	lastTime := startTime
+
+	for range ticker.C {
+		s.mu.Lock()
+		total := s.total
+		success := s.success
+		fail := s.fail
+		avgDur := time.Duration(0)
+		if total > 0 {
+			avgDur = s.totalDur / time.Duration(total)
+		}
+		minDur := s.minDur
+		maxDur := s.maxDur
+		s.mu.Unlock()
+
+		now := nowCST()
+		elapsed := now.Sub(lastTime)
+		intervalCount := total - lastTotal
+		rps := float64(intervalCount) / elapsed.Seconds()
+		lastTotal = total
+		lastTime = now
+
+		uptime := now.Sub(startTime)
+		log.Printf("⚡ [运行 %v] 总请求=%d 成功=%d 失败=%d | RPS=%.1f/s | 平均=%v 最小=%v 最大=%v",
+			uptime.Round(time.Second), total, success, fail,
+			rps, avgDur.Round(time.Millisecond), minDur.Round(time.Millisecond), maxDur.Round(time.Millisecond))
+	}
+}
+
+func main() {
 	initChinaLoc()
 	time.Local = chinaLoc
 
-	if *showVersion {
-		log.Printf("[nettap] version=%s", version)
-		return
-	}
-
 	log.Printf("[nettap] 启动 (version=%s)", version)
 
-	cfg, err := loadConfig(*configPath)
+	cfg, err := loadConfig(defaultConfigPath)
 	if err != nil {
 		log.Printf("⚠ 配置文件加载失败，使用默认值: %v", err)
-	}
-
-	if *interval != "" {
-		cfg.Interval = *interval
-	}
-	if *concurrency > 0 {
-		cfg.Concurrency = *concurrency
-	}
-	if *once {
-		cfg.Once = true
-	}
-
-	d, err := time.ParseDuration(cfg.Interval)
-	if err != nil {
-		log.Fatalf("无效的 interval 值 %q: %v（支持的格式: 30s, 5m, 1h, 2h30m 等）", cfg.Interval, err)
-	}
-	if d < time.Second {
-		log.Fatalf("interval 不能小于 1 秒")
-	}
-	if cfg.Concurrency < 1 {
-		log.Fatalf("concurrency 不能小于 1")
 	}
 
 	cfg.Timeout = func() int {
@@ -196,7 +248,31 @@ func main() {
 	}()
 	httpTimeout = time.Duration(cfg.Timeout) * time.Second
 
-	log.Printf("配置文件: %s", *configPath)
+	cpus := runtime.NumCPU()
+	if cfg.Concurrency < 1 {
+		if cfg.FullPower {
+			cfg.Concurrency = cpus * 10
+		} else {
+			cfg.Concurrency = 1
+		}
+	}
+
+	log.Printf("配置文件: %s | CPU 核心: %d", defaultConfigPath, cpus)
+
+	if cfg.FullPower {
+		log.Printf("⚡ 全力模式 | 每接口并发 %d (自动=%d)", cfg.Concurrency, cpus*10)
+		runFullPower(cfg.Concurrency)
+		return
+	}
+
+	d, err := time.ParseDuration(cfg.Interval)
+	if err != nil {
+		log.Fatalf("无效的 interval 值 %q: %v", cfg.Interval, err)
+	}
+	if d < time.Second {
+		log.Fatalf("interval 不能小于 1 秒")
+	}
+
 	log.Printf("执行模式: 每 %v 一轮, 每接口并发 %d", d, cfg.Concurrency)
 
 	if cfg.Once {
